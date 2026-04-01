@@ -1,0 +1,8 @@
+.env
+node_modules/
+dist/
+.gocache/
+coverage/
+.DS_Store
+Thumbs.db
+*.log

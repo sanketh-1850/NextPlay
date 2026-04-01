@@ -5,13 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:api": "node scripts/run-go.mjs -C server run .",
     "build": "tsc && vite build",
-    "build:api": "node scripts/run-go.mjs -C server build .",
     "preview": "vite preview",
-    "test": "npm run test:web && npm run test:api",
-    "test:web": "vitest run",
-    "test:api": "node scripts/run-go.mjs -C server test ./..."
+    "test": "npm run test:web",
+    "test:web": "vitest run"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
