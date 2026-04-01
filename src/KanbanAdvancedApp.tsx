@@ -44,6 +44,7 @@ const COLUMN_HEADER_HEIGHT = 84
 const CARD_GAP = 16
 const CARD_HEIGHT = 248
 const BOARD_PADDING = 20
+const MOBILE_BREAKPOINT = 960
 const MEMBER_COLORS = ['#89afd7', '#d8bf5c', '#97b85b', '#cf8ea0', '#c188e6']
 const LABEL_COLORS = ['#f8d978', '#c4e88e', '#ffbfd0', '#b9d7ff', '#d7c4ff']
 
@@ -55,6 +56,7 @@ type FilterState = {
 }
 
 function KanbanAdvancedApp() {
+  const isMobile = useIsMobileLayout()
   const [board, setBoard] = useState<BoardData>({ tasks: [], ...EMPTY_BOARD_DATA })
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null)
   const [hoveredColumn, setHoveredColumn] = useState<TaskStatus | null>(null)
@@ -167,13 +169,15 @@ function KanbanAdvancedApp() {
     ]
   }, [tasks])
 
+  const cardsPerRow = isMobile ? 1 : 2
+
   const boardHeight = useMemo(() => {
     const maxRows = Math.max(
-      ...STATUS_ORDER.map((status) => Math.max(Math.ceil(columns[status].length / 2), 2)),
+      ...STATUS_ORDER.map((status) => Math.max(Math.ceil(columns[status].length / cardsPerRow), 2)),
       2,
     )
     return COLUMN_HEADER_HEIGHT + BOARD_PADDING * 2 + maxRows * (CARD_HEIGHT + CARD_GAP)
-  }, [columns])
+  }, [cardsPerRow, columns])
 
   function openComposer(status: TaskStatus) {
     setDraft({
@@ -436,9 +440,18 @@ function KanbanAdvancedApp() {
     const rect = node.getBoundingClientRect()
     const relativeY = event.clientY - rect.top - COLUMN_HEADER_HEIGHT - BOARD_PADDING
     const relativeX = event.clientX - rect.left - BOARD_PADDING
-    const row = clamp(Math.floor(relativeY / (CARD_HEIGHT + CARD_GAP)), 0, Math.ceil(columns[status].length / 2) + 1)
-    const column = relativeX > rect.width / 2 ? 1 : 0
-    return clamp(row * 2 + column, 0, columns[status].length)
+    const row = clamp(
+      Math.floor(relativeY / (CARD_HEIGHT + CARD_GAP)),
+      0,
+      Math.ceil(columns[status].length / cardsPerRow) + 1,
+    )
+    const column =
+      cardsPerRow === 1
+        ? 0
+        : relativeX > rect.width / 2
+          ? 1
+          : 0
+    return clamp(row * cardsPerRow + column, 0, columns[status].length)
   }
 
   async function handleDrop(status: TaskStatus, event: DragEvent<HTMLDivElement>) {
@@ -554,7 +567,7 @@ function KanbanAdvancedApp() {
       {error ? <div className="board-inline-error">{error}</div> : null}
 
       <section className="whiteboard-frame">
-        <div className="whiteboard-surface" style={{ height: `${boardHeight}px` }}>
+        <div className="whiteboard-surface" style={{ minHeight: `${boardHeight}px` }}>
           {STATUS_ORDER.map((status, columnIndex) => {
             const columnTasks = columns[status]
 
@@ -576,9 +589,9 @@ function KanbanAdvancedApp() {
                 <header className="free-column-header">
                   <span>{columnHeaderLabel(status, columnIndex)}</span>
                 </header>
-                <div className="free-column-body">
+                <div className="free-column-body" style={{ height: `${columnBodyHeight(columnTasks.length, cardsPerRow)}px` }}>
                   {loading ? (
-                    <div className="sticky-card sticky-skeleton free-card" style={cardStyle(0, 'normal')} />
+                    <div className="sticky-card sticky-skeleton free-card" style={cardStyle(0, 'normal', cardsPerRow)} />
                   ) : (
                     columnTasks.map((task, index) => {
                       const taskMembers = membersForTask(members, taskAssignees, task.id)
@@ -588,7 +601,7 @@ function KanbanAdvancedApp() {
                         <article
                           key={task.id}
                           className={`sticky-card sticky-tone-${stickyToneForTask(task)} priority-${task.priority} free-card`}
-                          style={cardStyle(index, task.priority)}
+                          style={cardStyle(index, task.priority, cardsPerRow)}
                           draggable
                           onDragStart={() => setDraggedTaskId(task.id)}
                           onDragEnd={() => {
@@ -933,16 +946,17 @@ function TaskDialog({
   )
 }
 
-function cardStyle(index: number, priority: TaskPriority) {
+function cardStyle(index: number, priority: TaskPriority, cardsPerRow: number) {
   const rotateCycle = [-4, 3, -2, 5, -3]
   const rotate = `${rotateCycle[index % rotateCycle.length]}deg`
-  const column = index % 2
-  const row = Math.floor(index / 2)
-  const width = `calc((100% - ${(BOARD_PADDING * 2) + CARD_GAP}px) / 2)`
+  const column = cardsPerRow === 1 ? 0 : index % cardsPerRow
+  const row = Math.floor(index / cardsPerRow)
+  const totalGap = CARD_GAP * Math.max(cardsPerRow - 1, 0)
+  const width = `calc((100% - ${(BOARD_PADDING * 2) + totalGap}px) / ${cardsPerRow})`
   const left =
-    column === 0
+    cardsPerRow === 1
       ? `${BOARD_PADDING}px`
-      : `calc(${BOARD_PADDING}px + ((100% - ${(BOARD_PADDING * 2) + CARD_GAP}px) / 2) + ${CARD_GAP}px)`
+      : `calc(${BOARD_PADDING}px + ${column} * (((100% - ${(BOARD_PADDING * 2) + totalGap}px) / ${cardsPerRow}) + ${CARD_GAP}px))`
   return {
     top: `${BOARD_PADDING + row * (CARD_HEIGHT + CARD_GAP)}px`,
     left,
@@ -955,6 +969,11 @@ function cardStyle(index: number, priority: TaskPriority) {
         ? '0 18px 28px rgba(165, 96, 49, 0.18), inset 0 -14px 18px rgba(0, 0, 0, 0.05)'
         : '0 16px 24px rgba(101, 82, 48, 0.14), inset 0 -14px 18px rgba(0, 0, 0, 0.04)',
   } as CSSProperties
+}
+
+function columnBodyHeight(taskCount: number, cardsPerRow: number) {
+  const rows = Math.max(Math.ceil(taskCount / cardsPerRow), 1)
+  return BOARD_PADDING * 2 + rows * CARD_HEIGHT + Math.max(rows - 1, 0) * CARD_GAP
 }
 
 function columnHeaderLabel(status: TaskStatus, index: number) {
@@ -1144,6 +1163,25 @@ function asMessage(error: unknown) {
 
 function isAdvancedTablesMissingError(error: unknown) {
   return asMessage(error).includes('Advanced board tables are missing')
+}
+
+function useIsMobileLayout() {
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= MOBILE_BREAKPOINT : false,
+  )
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const mediaQuery = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT}px)`)
+    const sync = () => setIsMobile(mediaQuery.matches)
+    sync()
+
+    mediaQuery.addEventListener('change', sync)
+    return () => mediaQuery.removeEventListener('change', sync)
+  }, [])
+
+  return isMobile
 }
 
 export default KanbanAdvancedApp
