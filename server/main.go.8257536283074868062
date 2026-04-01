@@ -1,0 +1,520 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+type config struct {
+	Port            string
+	AllowedOrigin   string
+	SupabaseURL     string
+	SupabaseAnonKey string
+}
+
+type app struct {
+	cfg    config
+	client *http.Client
+}
+
+type task struct {
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	Status      string  `json:"status"`
+	UserID      string  `json:"user_id"`
+	CreatedAt   string  `json:"created_at"`
+	Description *string `json:"description"`
+	Priority    string  `json:"priority"`
+	DueDate     *string `json:"due_date"`
+	AssigneeID  *string `json:"assignee_id"`
+}
+
+type taskPayload struct {
+	Title       string  `json:"title"`
+	Description string  `json:"description"`
+	Status      string  `json:"status"`
+	Priority    string  `json:"priority"`
+	DueDate     *string `json:"dueDate"`
+}
+
+type taskUpdate struct {
+	Title       *string `json:"title"`
+	Description *string `json:"description"`
+	Status      *string `json:"status"`
+	Priority    *string `json:"priority"`
+	DueDate     *string `json:"dueDate"`
+}
+
+type supabaseUser struct {
+	ID string `json:"id"`
+}
+
+func main() {
+	cfg, err := loadConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	application := app{
+		cfg: cfg,
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+
+	server := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           application.routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	log.Printf("NextPlay API listening on http://localhost:%s", cfg.Port)
+	log.Fatal(server.ListenAndServe())
+}
+
+func loadConfigFromEnv() (config, error) {
+	loadDotEnv(".env", filepath.Join("..", ".env"))
+
+	cfg := config{
+		Port:          strings.TrimSpace(os.Getenv("PORT")),
+		AllowedOrigin: normalizeAllowedOrigin(os.Getenv("ALLOWED_ORIGIN")),
+	}
+
+	if cfg.Port == "" {
+		cfg.Port = "8080"
+	}
+
+	var err error
+	cfg.SupabaseURL, err = normalizeSupabaseURL(os.Getenv("SUPABASE_URL"))
+	if err != nil {
+		return config{}, err
+	}
+
+	cfg.SupabaseAnonKey, err = normalizeKey(os.Getenv("SUPABASE_ANON_KEY"), "SUPABASE_ANON_KEY")
+	if err != nil {
+		return config{}, err
+	}
+
+	return cfg, nil
+}
+
+func loadDotEnv(paths ...string) {
+	for _, path := range paths {
+		file, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+
+			key := strings.TrimSpace(parts[0])
+			value := trimEnv(parts[1])
+			if key == "" {
+				continue
+			}
+
+			if _, exists := os.LookupEnv(key); !exists {
+				_ = os.Setenv(key, value)
+			}
+		}
+	}
+}
+
+func normalizeSupabaseURL(raw string) (string, error) {
+	trimmed := trimEnv(raw)
+	if trimmed == "" {
+		return "", errors.New("missing SUPABASE_URL")
+	}
+
+	if !strings.HasPrefix(strings.ToLower(trimmed), "http://") && !strings.HasPrefix(strings.ToLower(trimmed), "https://") {
+		trimmed = "https://" + trimmed
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return "", fmt.Errorf("invalid SUPABASE_URL: %q", raw)
+	}
+
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func normalizeKey(raw string, envName string) (string, error) {
+	trimmed := trimEnv(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("missing %s", envName)
+	}
+	return trimmed, nil
+}
+
+func normalizeAllowedOrigin(raw string) string {
+	trimmed := trimEnv(raw)
+	if trimmed == "" {
+		return "http://localhost:5173"
+	}
+	return strings.TrimRight(trimmed, "/")
+}
+
+func trimEnv(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	return strings.Trim(trimmed, "\"'")
+}
+
+func (app *app) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", app.handleHealth)
+	mux.HandleFunc("GET /api/tasks", app.handleListTasks)
+	mux.HandleFunc("POST /api/tasks", app.handleCreateTask)
+	mux.HandleFunc("PATCH /api/tasks/{id}", app.handleUpdateTask)
+	mux.HandleFunc("DELETE /api/tasks/{id}", app.handleDeleteTask)
+
+	return app.withCORS(mux)
+}
+
+func (app *app) withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", app.cfg.AllowedOrigin)
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (app *app) handleHealth(w http.ResponseWriter, r *http.Request) {
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, app.cfg.SupabaseURL+"/auth/v1/settings", nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	request.Header.Set("apikey", app.cfg.SupabaseAnonKey)
+	response, err := app.client.Do(request)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode >= 300 {
+		body, _ := io.ReadAll(response.Body)
+		writeText(w, http.StatusBadGateway, string(body))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"supabase_url":  app.cfg.SupabaseURL,
+		"allowed_origin": app.cfg.AllowedOrigin,
+	})
+}
+
+func (app *app) handleListTasks(w http.ResponseWriter, r *http.Request) {
+	token, err := bearerToken(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+
+	query := url.Values{}
+	query.Set("select", "id,title,status,user_id,created_at,description,priority,due_date,assignee_id")
+	query.Set("order", "created_at.desc")
+
+	var items []task
+	status, err := app.supabaseJSON(r.Context(), http.MethodGet, "/rest/v1/tasks?"+query.Encode(), token, nil, nil, &items)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (app *app) handleCreateTask(w http.ResponseWriter, r *http.Request) {
+	token, err := bearerToken(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+
+	var payload taskPayload
+	if err := decodeJSON(r.Body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := validateTaskPayload(payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	user, status, err := app.currentUser(r.Context(), token)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+
+	record := map[string]any{
+		"title":       payload.Title,
+		"description": emptyStringAsNil(payload.Description),
+		"status":      payload.Status,
+		"priority":    payload.Priority,
+		"due_date":    emptyDateAsNil(payload.DueDate),
+		"user_id":     user.ID,
+	}
+
+	headers := map[string]string{
+		"Prefer": "return=representation",
+	}
+
+	var created []task
+	status, err = app.supabaseJSON(r.Context(), http.MethodPost, "/rest/v1/tasks?select=id,title,status,user_id,created_at,description,priority,due_date,assignee_id", token, headers, []map[string]any{record}, &created)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+
+	if len(created) == 0 {
+		writeText(w, http.StatusBadGateway, "Supabase returned no task record")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, created[0])
+}
+
+func (app *app) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
+	token, err := bearerToken(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+
+	var payload taskUpdate
+	if err := decodeJSON(r.Body, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	updates := map[string]any{}
+	if payload.Title != nil {
+		updates["title"] = strings.TrimSpace(*payload.Title)
+	}
+	if payload.Description != nil {
+		updates["description"] = emptyStringAsNil(*payload.Description)
+	}
+	if payload.Status != nil {
+		updates["status"] = *payload.Status
+	}
+	if payload.Priority != nil {
+		updates["priority"] = *payload.Priority
+	}
+	if payload.DueDate != nil {
+		updates["due_date"] = emptyDateAsNil(payload.DueDate)
+	}
+
+	if len(updates) == 0 {
+		writeText(w, http.StatusBadRequest, "No updates provided")
+		return
+	}
+
+	id := r.PathValue("id")
+	query := url.Values{}
+	query.Set("id", "eq."+id)
+	query.Set("select", "id,title,status,user_id,created_at,description,priority,due_date,assignee_id")
+
+	headers := map[string]string{
+		"Prefer": "return=representation",
+	}
+
+	var updated []task
+	status, err := app.supabaseJSON(r.Context(), http.MethodPatch, "/rest/v1/tasks?"+query.Encode(), token, headers, updates, &updated)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+
+	if len(updated) == 0 {
+		writeText(w, http.StatusNotFound, "Task not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, updated[0])
+}
+
+func (app *app) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
+	token, err := bearerToken(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+
+	id := r.PathValue("id")
+	query := url.Values{}
+	query.Set("id", "eq."+id)
+
+	status, err := app.supabaseJSON(r.Context(), http.MethodDelete, "/rest/v1/tasks?"+query.Encode(), token, nil, nil, nil)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func validateTaskPayload(payload taskPayload) error {
+	if strings.TrimSpace(payload.Title) == "" {
+		return errors.New("Task title is required")
+	}
+
+	if payload.Status == "" {
+		payload.Status = "todo"
+	}
+
+	switch payload.Status {
+	case "todo", "in_progress", "in_review", "done":
+	default:
+		return fmt.Errorf("unsupported status: %s", payload.Status)
+	}
+
+	switch payload.Priority {
+	case "", "low", "normal", "high":
+	default:
+		return fmt.Errorf("unsupported priority: %s", payload.Priority)
+	}
+
+	return nil
+}
+
+func (app *app) currentUser(ctx context.Context, token string) (supabaseUser, int, error) {
+	var user supabaseUser
+	status, err := app.supabaseJSON(ctx, http.MethodGet, "/auth/v1/user", token, nil, nil, &user)
+	return user, status, err
+}
+
+func (app *app) supabaseJSON(
+	ctx context.Context,
+	method string,
+	path string,
+	token string,
+	extraHeaders map[string]string,
+	body any,
+	out any,
+) (int, error) {
+	var payload io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		payload = bytes.NewReader(encoded)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, method, app.cfg.SupabaseURL+path, payload)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+
+	request.Header.Set("apikey", app.cfg.SupabaseAnonKey)
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range extraHeaders {
+		request.Header.Set(key, value)
+	}
+
+	response, err := app.client.Do(request)
+	if err != nil {
+		return http.StatusBadGateway, err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode >= 400 {
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, errors.New(string(body))
+	}
+
+	if out == nil || response.StatusCode == http.StatusNoContent {
+		return response.StatusCode, nil
+	}
+
+	if err := json.NewDecoder(response.Body).Decode(out); err != nil {
+		return http.StatusBadGateway, err
+	}
+
+	return response.StatusCode, nil
+}
+
+func decodeJSON(body io.Reader, out any) error {
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(out)
+}
+
+func bearerToken(r *http.Request) (string, error) {
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(header, "Bearer ") {
+		return "", errors.New("Missing Authorization bearer token")
+	}
+	return strings.TrimSpace(strings.TrimPrefix(header, "Bearer ")), nil
+}
+
+func emptyStringAsNil(raw string) any {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	return strings.TrimSpace(raw)
+}
+
+func emptyDateAsNil(raw *string) any {
+	if raw == nil {
+		return nil
+	}
+	if strings.TrimSpace(*raw) == "" {
+		return nil
+	}
+	return strings.TrimSpace(*raw)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeText(w http.ResponseWriter, status int, message string) {
+	http.Error(w, message, status)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeText(w, status, err.Error())
+}
